@@ -143,7 +143,7 @@ jobs:
             *) echo "Unknown profile: $PROFILE"; exit 2 ;;
           esac
 
-          mkdir -p openwrt/files/lib/firmware openwrt/files/etc/uci-defaults openwrt/files/etc/init.d openwrt/files/etc/uhp openwrt/files/usr/bin
+          mkdir -p openwrt/files/lib/firmware openwrt/files/etc/uci-defaults openwrt/files/etc/init.d openwrt/files/etc/rc.d openwrt/files/etc/uhp openwrt/files/usr/bin
           cp mt7603e_eeprom.bin openwrt/files/lib/firmware/mt7603e_eeprom.bin
           cp mt7612e_eeprom.bin openwrt/files/lib/firmware/mt7612e_eeprom.bin
 
