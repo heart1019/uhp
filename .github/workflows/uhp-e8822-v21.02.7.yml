@@ -69,6 +69,10 @@ jobs:
           test "$(stat -c%s mt7612e_eeprom.bin)" -eq 512
           cd openwrt
           git apply ../e8820v2.patch
+          # Current E8822 firmware reports board_name=zte,e8822. Keep the upstream
+          # E8820V2 hardware profile, but explicitly allow that runtime board ID.
+          sed -i '/DEVICE_MODEL := E8820V2/a\  SUPPORTED_DEVICES := zte,e8820v2 zte,e8822' target/linux/ramips/image/mt7621.mk
+          grep -A14 '^define Device/zte_e8820v2' target/linux/ramips/image/mt7621.mk
 
       - name: Update and install feeds
         working-directory: openwrt
