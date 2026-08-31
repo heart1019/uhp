@@ -1,0 +1,264 @@
+name: UHP E8822 OpenWrt 21.02.7
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Firmware profile
+        required: true
+        default: safe
+        type: choice
+        options:
+          - safe
+          - opennds
+          - coova
+  push:
+    paths:
+      - '.github/workflows/uhp-e8822-v21.02.7.yml'
+
+permissions:
+  contents: read
+
+env:
+  OPENWRT_REPO: https://github.com/openwrt/openwrt
+  OPENWRT_TAG: v21.02.7
+  E8822_UPSTREAM_COMMIT: 0f0af8f6f0ed953d39fa00baa2a715d46dbd39fb
+  TZ: Asia/Manila
+
+jobs:
+  build:
+    name: Build ${{ github.event_name == 'workflow_dispatch' && inputs.profile || matrix.profile }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: ${{ github.event_name == 'workflow_dispatch' && fromJSON(format('["{0}"]', inputs.profile)) || fromJSON('["safe","opennds","coova"]') }}
+
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib gettext git \
+            libncurses5-dev libssl-dev python3 python3-distutils rsync unzip \
+            zlib1g-dev file wget curl ca-certificates subversion swig time xsltproc \
+            libelf-dev device-tree-compiler ccache libltdl-dev libmpc-dev \
+            libmpfr-dev libgmp3-dev libpython3-dev libreadline-dev libtool-bin \
+            pkgconf qemu-utils squashfs-tools
+
+      - name: Clone OpenWrt 21.02.7
+        run: |
+          git clone --depth 1 --branch "$OPENWRT_TAG" "$OPENWRT_REPO" openwrt
+
+      - name: Fetch pinned E8822 board support
+        run: |
+          set -eux
+          BASE="https://raw.githubusercontent.com/hiliuyj/E8822-openwrt/$E8822_UPSTREAM_COMMIT/openwrt-21.02"
+          curl -fL "$BASE/e8820v2.patch" -o e8820v2.patch
+          curl -fL "$BASE/mt7603e_eeprom.bin" -o mt7603e_eeprom.bin
+          curl -fL "$BASE/mt7612e_eeprom.bin" -o mt7612e_eeprom.bin
+          test "$(stat -c%s mt7603e_eeprom.bin)" -eq 512
+          test "$(stat -c%s mt7612e_eeprom.bin)" -eq 512
+          cd openwrt
+          git apply ../e8820v2.patch
+
+      - name: Update and install feeds
+        working-directory: openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure UHP firmware profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROFILE='${{ matrix.profile }}'
+
+          cat > openwrt/.config <<'EOF'
+          CONFIG_TARGET_ramips=y
+          CONFIG_TARGET_ramips_mt7621=y
+          CONFIG_TARGET_ramips_mt7621_DEVICE_zte_e8820v2=y
+          CONFIG_TARGET_ROOTFS_SQUASHFS=y
+          CONFIG_TARGET_ROOTFS_INITRAMFS=y
+          CONFIG_TARGET_INITRAMFS_COMPRESSION_LZMA=y
+          CONFIG_PACKAGE_luci=y
+          CONFIG_PACKAGE_luci-base=y
+          CONFIG_PACKAGE_luci-app-firewall=y
+          CONFIG_PACKAGE_luci-theme-bootstrap=y
+          CONFIG_PACKAGE_uhttpd=y
+          CONFIG_PACKAGE_rpcd=y
+          CONFIG_PACKAGE_rpcd-mod-luci=y
+          CONFIG_PACKAGE_dropbear=y
+          CONFIG_PACKAGE_firewall=y
+          CONFIG_PACKAGE_iptables=y
+          CONFIG_PACKAGE_ip6tables=y
+          CONFIG_PACKAGE_ca-bundle=y
+          CONFIG_PACKAGE_ca-certificates=y
+          CONFIG_PACKAGE_kmod-mt7603=y
+          CONFIG_PACKAGE_kmod-mt76x2=y
+          CONFIG_PACKAGE_kmod-usb3=y
+          EOF
+
+          case "$PROFILE" in
+            safe)
+              ;;
+            opennds)
+              cat >> openwrt/.config <<'EOF'
+          CONFIG_PACKAGE_opennds=y
+          EOF
+              ;;
+            coova)
+              cat >> openwrt/.config <<'EOF'
+          CONFIG_PACKAGE_kmod-tun=y
+          CONFIG_PACKAGE_coova-chilli=y
+          CONFIG_PACKAGE_kmod-ipt-coova=y
+          CONFIG_COOVACHILLI_NOSSL=y
+          EOF
+              ;;
+            *) echo "Unknown profile: $PROFILE"; exit 2 ;;
+          esac
+
+          mkdir -p openwrt/files/lib/firmware openwrt/files/etc/uci-defaults openwrt/files/etc/uhp openwrt/files/usr/bin
+          cp mt7603e_eeprom.bin openwrt/files/lib/firmware/mt7603e_eeprom.bin
+          cp mt7612e_eeprom.bin openwrt/files/lib/firmware/mt7612e_eeprom.bin
+
+          cat > openwrt/files/etc/banner <<EOF
+           _   _ _   _ ____    _____ ___  ___  ____  ____
+          | | | | | | |  _ \\  | ____( _ )/ _ \\|___ \\|___ \\
+          | | | | |_| | |_) | |  _| / _ \\ (_) | __) | __) |
+          | |_| |  _  |  __/  | |__| (_) \\__, |/ __/ / __/
+           \\___/|_| |_|_|     |_____\\___/  /_/|_____|_____|
+
+          OpenWrt 21.02.7 UHP Edition - profile: $PROFILE
+          Management: 192.168.5.1 | SSID: UHP-Setup
+          EOF
+
+          cat > openwrt/files/etc/uci-defaults/99-uhp-firstboot <<'SH'
+          #!/bin/sh
+          # UHP safe first boot: management stays separate from any captive portal.
+          uci -q set system.@system[0].hostname='UHP-E8822'
+          uci -q set network.lan.ipaddr='192.168.5.1'
+          uci -q set network.lan.netmask='255.255.255.0'
+
+          for radio in radio0 radio1; do
+            if uci -q get wireless.$radio >/dev/null; then
+              uci set wireless.$radio.disabled='0'
+              uci set wireless.$radio.country='PH'
+            fi
+          done
+
+          setup_ap() {
+            radio="$1"; sec="$2"
+            if uci -q get wireless.$radio >/dev/null; then
+              if ! uci -q get wireless.$sec >/dev/null; then
+                sec="$(uci add wireless wifi-iface)"
+                uci set wireless.$sec.device="$radio"
+              fi
+              uci set wireless.$sec.network='lan'
+              uci set wireless.$sec.mode='ap'
+              uci set wireless.$sec.ssid='UHP-Setup'
+              uci set wireless.$sec.encryption='psk2'
+              uci set wireless.$sec.key='UHPSetup8822'
+            fi
+          }
+          setup_ap radio0 default_radio0
+          setup_ap radio1 default_radio1
+
+          uci commit system
+          uci commit network
+          uci commit wireless
+
+          if [ -x /etc/init.d/opennds ]; then
+            uci -q set opennds.@opennds[0].enabled='0'
+            uci -q commit opennds
+            /etc/init.d/opennds disable >/dev/null 2>&1 || true
+            /etc/init.d/opennds stop >/dev/null 2>&1 || true
+          fi
+          if [ -x /etc/init.d/chilli ]; then
+            uci -q set chilli.@chilli[0].disabled='1'
+            uci -q commit chilli
+            /etc/init.d/chilli disable >/dev/null 2>&1 || true
+            /etc/init.d/chilli stop >/dev/null 2>&1 || true
+          fi
+          exit 0
+          SH
+          chmod +x openwrt/files/etc/uci-defaults/99-uhp-firstboot
+
+          cat > openwrt/files/usr/bin/uhp-status <<'SH'
+          #!/bin/sh
+          echo '=== UHP E8822 STATUS ==='
+          ubus call system board 2>/dev/null || true
+          echo '--- interfaces ---'
+          ip addr
+          echo '--- packages ---'
+          opkg list-installed 2>/dev/null | grep -E '^(opennds|coova-chilli|kmod-tun|kmod-ipt-coova) ' || true
+          SH
+          chmod +x openwrt/files/usr/bin/uhp-status
+
+          cd openwrt
+          make defconfig
+          grep '^CONFIG_TARGET_ramips_mt7621_DEVICE_zte_e8820v2=y' .config
+          case "$PROFILE" in
+            opennds) grep '^CONFIG_PACKAGE_opennds=y' .config ;;
+            coova)
+              grep '^CONFIG_PACKAGE_kmod-tun=y' .config
+              grep '^CONFIG_PACKAGE_coova-chilli=y' .config
+              grep '^CONFIG_PACKAGE_kmod-ipt-coova=y' .config
+              ;;
+          esac
+
+      - name: Download sources
+        working-directory: openwrt
+        run: |
+          make download -j8
+          find dl -type f -size -1024c -print -delete || true
+
+      - name: Compile firmware
+        working-directory: openwrt
+        run: make -j1 V=s
+
+      - name: Package and verify firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROFILE='${{ matrix.profile }}'
+          TARGET='openwrt/bin/targets/ramips/mt7621'
+          test -d "$TARGET"
+          SYSUPGRADE="$(find "$TARGET" -maxdepth 1 -type f -name '*zte_e8820v2*squashfs-sysupgrade.bin' -print -quit)"
+          test -n "$SYSUPGRADE"
+          stat -c '%n %s bytes' "$SYSUPGRADE"
+          mkdir -p "artifact-$PROFILE"
+          cp "$TARGET"/*zte_e8820v2* "artifact-$PROFILE/" || true
+          cp "$TARGET"/sha256sums "artifact-$PROFILE/" 2>/dev/null || true
+          cp openwrt/.config "artifact-$PROFILE/UHP-$PROFILE.config"
+          cat > "artifact-$PROFILE/FLASH-FIRST.txt" <<EOF
+          UHP E8822 / E8820V2 - OpenWrt 21.02.7
+          Profile: $PROFILE
+          Management IP: 192.168.5.1
+          Management SSID: UHP-Setup
+          Management Wi-Fi key: UHPSetup8822
+
+          IMPORTANT:
+          1. Validate SAFE profile first before opennds/coova.
+          2. Verify LAN1-LAN4, WAN, 2.4 GHz and 5 GHz.
+          3. Do not preserve settings from unrelated/custom firmware on first test.
+          4. Do not force-install kmod packages from another kernel build.
+          5. Keep a Breed/U-Boot recovery path and full backup before flash.
+          EOF
+          (cd "artifact-$PROFILE" && sha256sum * > UHP-SHA256SUMS.txt)
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: UHP-E8822-21.02.7-${{ matrix.profile }}
+          path: artifact-${{ matrix.profile }}/
+          if-no-files-found: error
+          retention-days: 30
