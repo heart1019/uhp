@@ -130,7 +130,7 @@ jobs:
             *) echo "Unknown profile: $PROFILE"; exit 2 ;;
           esac
 
-          mkdir -p openwrt/files/lib/firmware openwrt/files/etc/uci-defaults openwrt/files/etc/uhp openwrt/files/usr/bin
+          mkdir -p openwrt/files/lib/firmware openwrt/files/etc/uci-defaults openwrt/files/etc/init.d openwrt/files/etc/uhp openwrt/files/usr/bin
           cp mt7603e_eeprom.bin openwrt/files/lib/firmware/mt7603e_eeprom.bin
           cp mt7612e_eeprom.bin openwrt/files/lib/firmware/mt7612e_eeprom.bin
 
@@ -147,10 +147,38 @@ jobs:
 
           cat > openwrt/files/etc/uci-defaults/99-uhp-firstboot <<'SH'
           #!/bin/sh
-          # UHP safe first boot: management stays separate from any captive portal.
+          # E8822 uses MT7621 DSA ports. Explicitly create the LAN bridge so all
+          # four LAN PHYs are administratively up, and keep WAN separate.
           uci -q set system.@system[0].hostname='UHP-E8822'
+
+          uci -q delete network.lan.ifname
+          uci -q set network.lan='interface'
+          uci -q set network.lan.device='br-lan'
+          uci -q set network.lan.proto='static'
           uci -q set network.lan.ipaddr='192.168.5.1'
           uci -q set network.lan.netmask='255.255.255.0'
+
+          uci -q delete network.br_lan
+          uci set network.br_lan='device'
+          uci set network.br_lan.name='br-lan'
+          uci set network.br_lan.type='bridge'
+          uci add_list network.br_lan.ports='lan1'
+          uci add_list network.br_lan.ports='lan2'
+          uci add_list network.br_lan.ports='lan3'
+          uci add_list network.br_lan.ports='lan4'
+          uci set network.br_lan.stp='1'
+
+          uci -q set network.wan='interface'
+          uci -q set network.wan.device='wan'
+          uci -q set network.wan.proto='dhcp'
+
+          # Ensure DHCP is available immediately on every LAN port.
+          uci -q set dhcp.lan='dhcp'
+          uci -q set dhcp.lan.interface='lan'
+          uci -q set dhcp.lan.start='100'
+          uci -q set dhcp.lan.limit='100'
+          uci -q set dhcp.lan.leasetime='12h'
+          uci -q delete dhcp.lan.ignore
 
           for radio in radio0 radio1; do
             if uci -q get wireless.$radio >/dev/null; then
@@ -178,6 +206,7 @@ jobs:
 
           uci commit system
           uci commit network
+          uci commit dhcp
           uci commit wireless
 
           if [ -x /etc/init.d/opennds ]; then
@@ -196,12 +225,31 @@ jobs:
           SH
           chmod +x openwrt/files/etc/uci-defaults/99-uhp-firstboot
 
+          cat > openwrt/files/etc/init.d/uhp-ports <<'SH'
+          #!/bin/sh /etc/rc.common
+          START=95
+          USE_PROCD=0
+          start() {
+            for p in lan1 lan2 lan3 lan4 wan; do
+              ip link show "$p" >/dev/null 2>&1 && ip link set dev "$p" up || true
+            done
+            ip link show br-lan >/dev/null 2>&1 && ip link set dev br-lan up || true
+          }
+          SH
+          chmod +x openwrt/files/etc/init.d/uhp-ports
+          ln -sf ../init.d/uhp-ports openwrt/files/etc/rc.d/S95uhp-ports
+
           cat > openwrt/files/usr/bin/uhp-status <<'SH'
           #!/bin/sh
           echo '=== UHP E8822 STATUS ==='
           ubus call system board 2>/dev/null || true
           echo '--- interfaces ---'
-          ip addr
+          ip -br link
+          ip -br addr
+          echo '--- DSA port state ---'
+          for p in lan1 lan2 lan3 lan4 wan; do
+            ip -d link show "$p" 2>/dev/null || true
+          done
           echo '--- packages ---'
           opkg list-installed 2>/dev/null | grep -E '^(opennds|coova-chilli|kmod-tun|kmod-ipt-coova) ' || true
           SH
@@ -249,6 +297,7 @@ jobs:
           Management IP: 192.168.5.1
           Management SSID: UHP-Setup
           Management Wi-Fi key: UHPSetup8822
+          Ethernet: LAN1-LAN4 explicitly bridged and forced up; WAN separate DHCP client.
 
           IMPORTANT:
           1. Validate SAFE profile first before opennds/coova.
