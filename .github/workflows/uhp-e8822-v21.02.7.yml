@@ -69,6 +69,19 @@ jobs:
           test "$(stat -c%s mt7612e_eeprom.bin)" -eq 512
           cd openwrt
           git apply ../e8820v2.patch
+
+          # DIAGNOSTIC (Round 1): List any pre-existing OpenWrt patch layer
+          # that already references drivers/net/dsa/mt7530.c.  We already
+          # audited filenames; this scans inside patch text.  Diagnostic
+          # only — never fails on match.
+          echo '=== mt7530.c mentions in OpenWrt patch layers (diagnostic) ==='
+          grep -RIl 'drivers/net/dsa/mt7530.c' \
+              target/linux/generic/backport-5.4 \
+              target/linux/generic/pending-5.4 \
+              target/linux/generic/hack-5.4 \
+              target/linux/ramips/patches-5.4 2>/dev/null || true
+          echo '=== (end diagnostic) ==='
+
           # Current E8822 firmware reports board_name=zte,e8822. Keep the upstream
           # E8820V2 hardware profile, but explicitly allow that runtime board ID.
           sed -i '/DEVICE_MODEL := E8820V2/a\  SUPPORTED_DEVICES := zte,e8820v2 zte,e8822' target/linux/ramips/image/mt7621.mk
@@ -86,6 +99,61 @@ jobs:
           };
           EOF
           grep -A4 '^&ethernet' target/linux/ramips/dts/mt7621_zte_e8820v2.dts
+
+      # ─────────────────────────────────────────────────────────────────
+      # ROUND 1 — mt7530 MCM reset pulse 1 ms → 5 ms.
+      # Write a single, syntactically valid unified-diff kernel patch that
+      # changes ONLY the MCM-branch usleep_range between
+      # reset_control_assert and reset_control_deassert.
+      #
+      # Scope:
+      #   * MCM branch:       usleep_range(1000,1100) → (5000,5100)  CHANGED
+      #   * non-MCM GPIO:     usleep_range(1000,1100)                UNCHANGED
+      #   * HWTRAP poll       interval 20 / timeout 1,000,000         UNCHANGED
+      #   * post-deassert usleep_range(20ms)                         NOT ADDED
+      #   * DTS, pinctrl, topology, GMAC1, PHY nodes                UNCHANGED
+      #
+      # Quoted heredoc <<'PATCH' preserves literal TAB indentation in the
+      # hunk body (kernel C style uses real tabs).
+      # ─────────────────────────────────────────────────────────────────
+      - name: Round 1 — write mt7530 MCM 5 ms reset pulse patch
+        working-directory: openwrt
+        run: |
+          set -euo pipefail
+          mkdir -p target/linux/ramips/patches-5.4
+          P='target/linux/ramips/patches-5.4/999-mt7530-mcm-reset-pulse-5ms.patch'
+
+          # Unified-diff format: each hunk line is:
+          #   " " (1 space prefix) + exact original source line   (context)
+          #   "-" (1 minus prefix) + exact original source line   (removed)
+          #   "+" (1 plus  prefix) + exact new source line        (added)
+          # Kernel C style uses 4 spaces for outer function-body indent and
+          # one real TAB for brace-body statements.  We produce the patch
+          # via printf with explicit \t, then "|" prefix add 1 leading space
+          # for context lines so the unified-diff first-byte rule holds.
+          {
+              printf '%s\n' '--- a/drivers/net/dsa/mt7530.c'
+              printf '%s\n' '+++ b/drivers/net/dsa/mt7530.c'
+              printf '%s\n' '@@ -1198,7 +1198,7 @@ mt7530_setup(struct dsa_switch *ds)'
+              printf ' %s\n' '    */'
+              printf ' %s\n' '    if (priv->mcm) {'
+              printf '\t%s\n' 'reset_control_assert(priv->rstc);' | sed 's#^# #'
+              printf '%s\n' '-    usleep_range(1000, 1100);'
+              printf '%s\n' '+    usleep_range(5000, 5100);'
+              printf '\t%s\n' 'reset_control_deassert(priv->rstc);' | sed 's#^# #'
+              printf ' %s\n' '    } else {'
+              printf '\t%s\n' 'gpiod_set_value_cansleep(priv->reset, 0);' | sed 's#^# #'
+          } > "$P"
+
+          echo '=== Round-1 patch file (tabs shown as ^I via cat -A) ==='
+          cat -A "$P"
+          echo '=== (end) ==='
+          grep -qF 'usleep_range(5000, 5100)' "$P"
+          # Guard: at least 2 context inner-body lines start with [ +-]TAB.
+          # If absent, our patch file has spaces-not-tabs → fail immediately.
+          TABS="$(awk '/^[- +]\t/ {n++} END {print n+0}' "$P")"
+          echo "Patch body tab-indent count: $TABS"
+          test "$TABS" -ge 2
 
       - name: Update and install feeds
         working-directory: openwrt
@@ -270,6 +338,67 @@ jobs:
 
           cd openwrt
           make defconfig
+
+          # ══════════════════════════════════════════════════════════════════
+          # ROUND 1 STRONG PATCH-APPLICATION VERIFICATION (applies to real
+          # prepared kernel source, not just the patch text file).
+          #
+          # Order:
+          #   1. `make target/linux/prepare` — runs OpenWrt Kernel/Prepare:
+          #      unpacks linux-5.4.238 tarball, then applies all patch
+          #      layers in order: generic/{backport,pending,hack}-5.4, then
+          #      ramips/patches-5.4.  Our 999- patch runs LAST.
+          #      If the unified-diff hunk fails, quilt aborts here with a
+          #      nonzero exit → `set -e` → build FAILS before wasting
+          #      hours compiling.
+          #
+          #   2. Locate the actual prepared source tree.
+          #
+          #   3. MCM branch verification — extract the exact 3-line block
+          #      that begins right after reset_control_assert(priv->rstc).
+          #      Require BOTH the new 5 ms sleep AND the deassert line in
+          #      that same block.  This cannot spuriously match another
+          #      unrelated `usleep_range(5000,…)` elsewhere in the file
+          #      because we anchor on `reset_control_assert(priv->rstc)`.
+          #
+          #   4. NON-MCM branch verification — grep the prepared source
+          #      for the ORIGINAL 1 ms sleep still being present.  Proves
+          #      we did NOT accidentally patch the GPIO/non-MCM branch.
+          #
+          #   5. Emit full context (B3/A9) into the Actions log so it is
+          #      visually auditable after the build:
+          #          ... MCM assert
+          #              usleep(5000, 5100)
+          #              deassert
+          #          } else {
+          #              gpiod_set_value(..., 0)
+          #              usleep(1000, 1100)    ← unchanged!
+          #              gpiod_set_value(..., 1)
+          # ══════════════════════════════════════════════════════════════════
+          make target/linux/prepare
+          KBUILDDIR="$(find build_dir -maxdepth 3 -type d -name 'linux-5.4.*' -print -quit)"
+          test -n "$KBUILDDIR"
+          MT7530C="$KBUILDDIR/drivers/net/dsa/mt7530.c"
+          test -f "$MT7530C"
+
+          echo "=== Round-1: prepared mt7530.c — full reset block context ==="
+          grep -n -B3 -A9 'reset_control_assert(priv->rstc)' "$MT7530C"
+          echo "=== (end) ==="
+
+          MCM_BLOCK="$(grep -F -A3 'reset_control_assert(priv->rstc);' "$MT7530C")"
+          printf '%s\n' "$MCM_BLOCK"
+          printf '%s\n' "$MCM_BLOCK" | grep -qF 'usleep_range(5000, 5100);'
+          printf '%s\n' "$MCM_BLOCK" | grep -qF 'reset_control_deassert(priv->rstc);'
+
+          # non-MCM GPIO branch — must still contain the ORIGINAL 1 ms.
+          echo "=== Round-1: non-MCM GPIO reset block (must stay 1 ms) ==="
+          grep -n -B2 -A6 'gpiod_set_value_cansleep(priv->reset, 0);' "$MT7530C"
+          echo "=== (end) ==="
+          GPIOBLOCK="$(grep -F -A3 'gpiod_set_value_cansleep(priv->reset, 0);' "$MT7530C")"
+          printf '%s\n' "$GPIOBLOCK"
+          printf '%s\n' "$GPIOBLOCK" | grep -qF 'usleep_range(1000, 1100);'
+          printf '%s\n' "$GPIOBLOCK" | grep -qF 'gpiod_set_value_cansleep(priv->reset, 1);'
+
           grep '^CONFIG_TARGET_ramips_mt7621_DEVICE_zte_e8820v2=y' .config
           case "$PROFILE" in
             opennds) grep '^CONFIG_PACKAGE_opennds=y' .config ;;
