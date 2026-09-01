@@ -116,44 +116,78 @@ jobs:
       # Quoted heredoc <<'PATCH' preserves literal TAB indentation in the
       # hunk body (kernel C style uses real tabs).
       # ─────────────────────────────────────────────────────────────────
-      - name: Round 1 — write mt7530 MCM 5 ms reset pulse patch
+      - name: Round 1 — write mt7530 MCM 5 ms reset pulse patch (Python, correct tabs)
         working-directory: openwrt
         run: |
           set -euo pipefail
           mkdir -p target/linux/ramips/patches-5.4
           P='target/linux/ramips/patches-5.4/999-mt7530-mcm-reset-pulse-5ms.patch'
 
-          # Unified-diff format: each hunk line is:
-          #   " " (1 space prefix) + exact original source line   (context)
-          #   "-" (1 minus prefix) + exact original source line   (removed)
-          #   "+" (1 plus  prefix) + exact new source line        (added)
-          # Kernel C style uses 4 spaces for outer function-body indent and
-          # one real TAB for brace-body statements.  We produce the patch
-          # via printf with explicit \t, then "|" prefix add 1 leading space
-          # for context lines so the unified-diff first-byte rule holds.
-          {
-              printf '%s\n' '--- a/drivers/net/dsa/mt7530.c'
-              printf '%s\n' '+++ b/drivers/net/dsa/mt7530.c'
-              printf '%s\n' '@@ -1198,7 +1198,7 @@ mt7530_setup(struct dsa_switch *ds)'
-              printf ' %s\n' '    */'
-              printf ' %s\n' '    if (priv->mcm) {'
-              printf '\t%s\n' 'reset_control_assert(priv->rstc);' | sed 's#^# #'
-              printf '%s\n' '-    usleep_range(1000, 1100);'
-              printf '%s\n' '+    usleep_range(5000, 5100);'
-              printf '\t%s\n' 'reset_control_deassert(priv->rstc);' | sed 's#^# #'
-              printf ' %s\n' '    } else {'
-              printf '\t%s\n' 'gpiod_set_value_cansleep(priv->reset, 0);' | sed 's#^# #'
-          } > "$P"
+          # Generate the patch via python3.
+          # Real source indentation in linux-5.4.238 mt7530_setup() reset block
+          # (verified byte-for-byte via od -An -t x1 against actual source):
+          #   comment-tail line " */"                 -> 1 leading TAB
+          #   "if (priv->mcm) {"                       -> 1 leading TAB
+          #   brace-body assert/deassert/usleep/gpiod  -> 2 leading TABs
+          #   "} else {"                               -> 1 leading TAB
+          # Unified-diff line prefix rule (strict, patch -F 0 requires exact bytes):
+          #   context -> 0x20 (SPACE) + source_bytes
+          #   removed -> 0x2d (MINUS) + source_bytes
+          #   added   -> 0x2b (PLUS)  + source_bytes
+          # => resulting hunk body line prefixes:
+          #   " \t..."  (context, 1 TAB outer)       -> hex 20 09
+          #   " \t\t..."(context, 2 TAB body)        -> hex 20 09 09
+          #   "-\t\t..."(removed, 2 TAB body)        -> hex 2d 09 09
+          #   "+\t\t..."(added,   2 TAB body)        -> hex 2b 09 09
+          python3 - <<'PY'
+          from pathlib import Path
+
+          T1 = "\t"
+          T2 = "\t\t"
+          NL = "\n"
+          SP = " "
+          MI = "-"
+          PL = "+"
+
+          patch_lines = [
+              "--- a/drivers/net/dsa/mt7530.c" + NL,
+              "+++ b/drivers/net/dsa/mt7530.c" + NL,
+              "@@ -1198,7 +1198,7 @@ mt7530_setup(struct dsa_switch *ds)" + NL,
+              SP + T1 + " */" + NL,
+              SP + T1 + "if (priv->mcm) {" + NL,
+              SP + T2 + "reset_control_assert(priv->rstc);" + NL,
+              MI + T2 + "usleep_range(1000, 1100);" + NL,
+              PL + T2 + "usleep_range(5000, 5100);" + NL,
+              SP + T2 + "reset_control_deassert(priv->rstc);" + NL,
+              SP + T1 + "} else {" + NL,
+              SP + T2 + "gpiod_set_value_cansleep(priv->reset, 0);" + NL,
+          ]
+
+          p = Path("target/linux/ramips/patches-5.4/999-mt7530-mcm-reset-pulse-5ms.patch")
+          p.write_bytes(b"".join(line.encode("ascii") for line in patch_lines))
+          print(f"Wrote patch {p} size={p.stat().st_size} bytes")
+          PY
 
           echo '=== Round-1 patch file (tabs shown as ^I via cat -A) ==='
           cat -A "$P"
           echo '=== (end) ==='
+
+          # Hunk body audit: extract lines 4..10 (the 7 hunk lines after headers)
+          # and verify every context/removed/added body line has real TAB (0x09)
+          # at the correct indentation level via od hex.
+          echo '=== Round-1 patch: hunk body L4..L10 hex (od -An -t x1) ==='
+          sed -n '4,10p' "$P" | od -An -t x1
+          echo '=== (end hex) ==='
+
+          # Must contain the new usleep value.
           grep -qF 'usleep_range(5000, 5100)' "$P"
-          # Guard: at least 2 context inner-body lines start with [ +-]TAB.
-          # If absent, our patch file has spaces-not-tabs → fail immediately.
+
+          # Tab-count guard: AT LEAST 5 hunk-body lines begin with [SP +-] + TAB.
+          # (7 hunk-body lines total -> the brace-body ones are SP + TAB TAB = 2xTAB,
+          #  outer if/else lines are SP + TAB = 1xTAB, all should match below regex.)
           TABS="$(awk '/^[- +]\t/ {n++} END {print n+0}' "$P")"
-          echo "Patch body tab-indent count: $TABS"
-          test "$TABS" -ge 2
+          echo "Patch body tab-indent count (>=5 expected): $TABS"
+          test "$TABS" -ge 5
 
       - name: Update and install feeds
         working-directory: openwrt
